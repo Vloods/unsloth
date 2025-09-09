@@ -21,6 +21,7 @@ from ._utils import *
 from ._utils import patch_unsloth_smart_gradient_checkpointing
 from ._utils import __version__
 from ._utils import move_to_device
+from ._utils import _prepare_model_for_qat
 from torch.nn.functional import scaled_dot_product_attention
 from transformers import __version__ as transformers_version
 from unsloth_zoo.utils import Version, _get_dtype
@@ -115,51 +116,16 @@ torch_nn_functional_softmax = torch.nn.functional.softmax
 SDPA_HAS_GQA = "enable_gqa" in scaled_dot_product_attention.__doc__
 
 
-def _prepare_model_for_qat(model: torch.nn.Module, qat_scheme: str) -> torch.nn.Module:
-    """
-    Apply QAT + LoRA during fine-tuning.
-
-    On a high level, this means fake quantizing the base (frozen) model during LoRA training.
-    Fake quantization refers to simulating quantization numerics in high precision (e.g. bf16).
-    This helps mitigate quantization degradations when the model is quantized after training.
-
-    For more details: https://dev-discuss.pytorch.org/t/speeding-up-qat-by-1-89x-with-lora/2700
-    """
-    try:
-        from torchao.quantization import (
-            Float8DynamicActivationFloat8WeightConfig,
-            Float8DynamicActivationInt4WeightConfig,
-            PerRow,
-            quantize_,
-        )
-        from torchao.quantization.qat import QATConfig
-    except ImportError as e:
-        print(
-            "Please install torchao nightly for the latest QAT features:\n"
-            "  pip install --pre torchao --index-url https://download.pytorch.org/whl/nightly/cu126"
-        )
-        raise e
-    pass
-    filter_fn = None
-    if qat_scheme == "fp8-int4":
-        group_size = 128
-        base_config = Float8DynamicActivationInt4WeightConfig(group_size=group_size)
-        filter_fn = lambda m, _: isinstance(m, torch.nn.Linear) and m.in_features >= group_size
-    elif qat_scheme == "fp8-fp8":
-        base_config = Float8DynamicActivationFloat8WeightConfig(granularity=PerRow())
-    else:
-        raise ValueError(f"Unexpected QAT scheme {qat_scheme}")
-    pass
-    quantize_(model, QATConfig(base_config, step="prepare"), filter_fn=filter_fn)
-    return model
-pass
-
 # Fix new HF's inference code
 def _fast_prepare_inputs_for_generation(self, input_ids, attention_mask=None, **kwargs,):
     past_key_values = kwargs.get("past_key_values", None)
     if past_key_values is not None:
         # Check for uninitialized DynamicCache
         if len(past_key_values) == 0:
+            past_key_values = None
+            kwargs["past_key_values"] = None
+        # New since 4.56
+        elif hasattr(past_key_values, "get_seq_length") and past_key_values.get_seq_length() == 0:
             past_key_values = None
             kwargs["past_key_values"] = None
         else:
@@ -1232,7 +1198,7 @@ def CausalLM_fast_forward(fast_forward_inference):
             # < 1024 Normal Unsloth uses less VRAM!
             if bsz*q_len <= 1024: RETURN_LOGITS = True
 
-            if not RETURN_LOGITS and HAS_CUT_CROSS_ENTROPY and labels is not None:
+            if not RETURN_LOGITS and labels is not None:
 
                 n_items = kwargs.get("num_items_in_batch", None) or kwargs.get("n_items", None)
 
@@ -1255,7 +1221,7 @@ def CausalLM_fast_forward(fast_forward_inference):
                     mask                 = None,
                     n_items              = n_items,
                     scaling              = getattr(self, "accelerator_scaler", None),
-                    target_gb            = 1,
+                    target_gb            = None,
                     torch_compile        = True,
                     logit_softcapping    = logit_softcapping,
                 )
@@ -1833,7 +1799,7 @@ class FastLlamaModel:
 
         # Solves https://github.com/unslothai/unsloth/issues/168
         # Static KV Cache was introduced in 4.38.0, causing training to be much slower.
-        # Inferene can now be CUDAGraphed, but we shall retain the old rotary embeddings.
+        # Inference can now be CUDAGraphed, but we shall retain the old rotary embeddings.
         # https://github.com/huggingface/transformers/pull/27931
         # https://github.com/huggingface/transformers/blob/v4.37.2/src/transformers/models/llama/modeling_llama.py
         import transformers.models.llama.modeling_llama
@@ -1866,6 +1832,7 @@ class FastLlamaModel:
         disable_log_stats = False,
         unsloth_vllm_standby = False,
         num_labels =  None,
+        qat_scheme = None,
         **kwargs,
     ):
         os.environ["UNSLOTH_USE_NEW_MODEL"] = "0"
@@ -2835,7 +2802,7 @@ class FastLlamaModel:
             for idx, layer in enumerate(model.model.model.layers):
 
                 if model_type != "falcon_h1":
-                    # LoRAMLP.apply doesn't have functionality for gate and down mutlipliers yet.
+                    # LoRAMLP.apply doesn't have functionality for gate and down multipliers yet.
                     # Don't patch falcon h1 for the time being.
 
                     # MLP patching
@@ -2982,6 +2949,7 @@ class FastLlamaModel:
             _for_inference(m)
             m = m.model
         _for_inference(m)
+        model.eval() # to turn off training on modules deeper in
 
         # Since transformers 4.53, must turn off explicitly
         for module in model.modules():
@@ -3026,6 +2994,7 @@ class FastLlamaModel:
             _for_training(m)
             m = m.model
         _for_training(m)
+        model.train() # to turn on training on modules deeper in
 
         # Since transformers 4.53, must turn on explicitly
         for module in model.modules():

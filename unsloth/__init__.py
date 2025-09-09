@@ -91,11 +91,23 @@ DEVICE_COUNT : int = get_device_count()
 
 # Reduce VRAM usage by reducing fragmentation
 # And optimize pinning of memory
-if DEVICE_TYPE == "cuda" and os.environ.get("UNSLOTH_VLLM_STANDBY", "0")=="0":
+if (DEVICE_TYPE == "cuda") and (os.environ.get("UNSLOTH_VLLM_STANDBY", "0")=="0"):
     os.environ["PYTORCH_CUDA_ALLOC_CONF"] = \
         "expandable_segments:True,"\
         "roundup_power2_divisions:[32:256,64:128,256:64,>:32]"
-
+elif (DEVICE_TYPE == "cuda") and (os.environ.get("UNSLOTH_VLLM_STANDBY", "0")=="1") and \
+    ("expandable_segments:True" in os.environ.get("PYTORCH_CUDA_ALLOC_CONF", "")):
+    warnings.warn(
+        "Unsloth: `UNSLOTH_VLLM_STANDBY` is on, but requires `expandable_segments` to be off.\n"\
+        "We will remove `expandable_segments`.",
+        stacklevel = 2,
+    )
+    os.environ["PYTORCH_CUDA_ALLOC_CONF"] = re.sub(
+        r"expandable\_segments\:True\,?",
+        "",
+        os.environ["PYTORCH_CUDA_ALLOC_CONF"],
+    )
+pass
 # We support Pytorch 2
 # Fixes https://github.com/unslothai/unsloth/issues/38
 torch_version = str(re.match(r"[0-9\.]{3,}", str(torch.__version__)).group(0)).split(".")
@@ -124,6 +136,8 @@ from .import_fixes import fix_xformers_performance_issue
 fix_xformers_performance_issue(); del fix_xformers_performance_issue;
 from .import_fixes import fix_vllm_aimv2_issue
 fix_vllm_aimv2_issue(); del fix_vllm_aimv2_issue;
+from .import_fixes import ignore_logger_messages
+ignore_logger_messages(); del ignore_logger_messages;
 
 # Torch 2.4 has including_emulation
 if DEVICE_TYPE == "cuda":
@@ -212,7 +226,7 @@ elif DEVICE_TYPE == "xpu":
 # Check for unsloth_zoo
 try:
     unsloth_zoo_version = importlib_version("unsloth_zoo")
-    if Version(unsloth_zoo_version) < Version("2025.8.8"):
+    if Version(unsloth_zoo_version) < Version("2025.9.3"):
         print(
             "Unsloth: Please update Unsloth and Unsloth-Zoo to the latest version!\n"\
             "Do this via `pip install --upgrade --force-reinstall --no-cache-dir --no-deps unsloth unsloth_zoo`"
